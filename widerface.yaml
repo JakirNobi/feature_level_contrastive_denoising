@@ -1,0 +1,17 @@
+# Wider Face dataset configuration for YOLO format
+path: ./datasets/widerface
+train: images/train
+val: images/val
+test: images/test
+
+# Single class: face
+names:
+  0: face
+
+nc: 1
+
+# Download script info
+download: |
+  # 1. Download Wider Face from http://shuoyang1213.me/WIDERFACE/
+  # 2. Convert to YOLO format using utils/widerface_utils.py
+  # 3. Place in ./datasets/widerface/

@@ -1,0 +1,7 @@
+{
+    "use_geometric": false,
+    "use_semantic": false,
+    "lambda_contrastive": 0.5,
+    "run_name": "baseline",
+    "description": "Standard YOLO26s without auxiliary encoders. Noise augmentation only."
+}

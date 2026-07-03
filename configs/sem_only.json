@@ -1,0 +1,7 @@
+{
+    "use_geometric": false,
+    "use_semantic": true,
+    "lambda_contrastive": 0.5,
+    "run_name": "sem_only",
+    "description": "YOLO26s with semantic encoder only. Tests contribution of high-level feature guidance."
+}

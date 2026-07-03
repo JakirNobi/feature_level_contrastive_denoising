@@ -1,0 +1,7 @@
+{
+    "use_geometric": true,
+    "use_semantic": false,
+    "lambda_contrastive": 0.5,
+    "run_name": "geo_only",
+    "description": "YOLO26s with geometric encoder only. Tests contribution of edge/structural features."
+}
