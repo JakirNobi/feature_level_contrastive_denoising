@@ -87,15 +87,14 @@ class GeometricEncoder(nn.Module):
 class SemanticEncoder(nn.Module):
     """
     Lightweight clean feature extractor capturing high-level
-    semantic information (facial structures, identity cues).
-    Outputs: P3 (1/8), P4 (1/16), P5 (1/32).
+    semantic information. Outputs: P3 (1/8), P4 (1/16), P5 (1/32).
     """
-
     def __init__(self, out_channels_list: Optional[List[int]] = None) -> None:
         super().__init__()
         if out_channels_list is None:
             out_channels_list = [128, 256, 512]
 
+        # Stem: 3 stride‑2 convs -> 1/8 resolution
         self.stem: nn.Sequential = nn.Sequential(
             nn.Conv2d(3, 32, 3, stride=2, padding=1),
             nn.BatchNorm2d(32), nn.SiLU(),
@@ -104,26 +103,28 @@ class SemanticEncoder(nn.Module):
             nn.Conv2d(64, 128, 3, stride=2, padding=1),
             nn.BatchNorm2d(128), nn.SiLU(),
         )
+        # P3: keep spatial size (80x80), just change channels
         self.p3_branch: nn.Sequential = nn.Sequential(
-            nn.Conv2d(128, out_channels_list[0], 3, stride=2, padding=1),
+            nn.Conv2d(128, out_channels_list[0], 3, stride=1, padding=1),
             nn.BatchNorm2d(out_channels_list[0]), nn.SiLU(),
         )
+        # P4: stride 2 -> 40x40
         self.p4_branch: nn.Sequential = nn.Sequential(
             nn.Conv2d(out_channels_list[0], out_channels_list[1], 3, stride=2, padding=1),
             nn.BatchNorm2d(out_channels_list[1]), nn.SiLU(),
         )
+        # P5: stride 2 -> 20x20
         self.p5_branch: nn.Sequential = nn.Sequential(
             nn.Conv2d(out_channels_list[1], out_channels_list[2], 3, stride=2, padding=1),
             nn.BatchNorm2d(out_channels_list[2]), nn.SiLU(),
         )
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x = self.stem(x)
-        p3: torch.Tensor = self.p3_branch(x)
-        p4: torch.Tensor = self.p4_branch(p3)
-        p5: torch.Tensor = self.p5_branch(p4)
+        x = self.stem(x)               # (B,128,80,80)
+        p3 = self.p3_branch(x)         # (B,128,80,80)
+        p4 = self.p4_branch(p3)        # (B,256,40,40)
+        p5 = self.p5_branch(p4)        # (B,512,20,20)
         return [p3, p4, p5]
-
 
 class FusionModule(nn.Module):
     """
