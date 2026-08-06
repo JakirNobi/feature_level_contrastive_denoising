@@ -1,7 +1,0 @@
-{
-    "use_geometric": true,
-    "use_semantic": true,
-    "lambda_contrastive": 0.5,
-    "run_name": "full_model",
-    "description": "YOLO26s with both geometric and semantic encoders. Complete contrastive denoising system."
-}
