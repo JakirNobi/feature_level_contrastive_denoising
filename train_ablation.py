@@ -4,6 +4,7 @@ CFDN‑YOLO Ablation Study – final custom trainer (validation OFF).
 Auxiliary modules live on the trainer; training path activated only when
 'bboxes' is in the batch. Validation and final_eval are skipped entirely.
 Gradient-conflict diagnostic runs every 50 batches.
+Uses a separate AdamW optimizer for auxiliary modules to avoid MuSGD incompatibility.
 """
 
 import torch
@@ -62,7 +63,8 @@ class AblationConfig:
 class CFDNTrainer(DetectionTrainer):
     """
     Custom trainer that holds auxiliary modules as trainer attributes.
-    Their parameters are added to the optimizer via build_optimizer and moved to GPU in on_train_start.
+    Their parameters are updated by a separate AdamW optimizer to avoid
+    incompatibility with the main MuSGD optimizer.
     Validation is skipped entirely during training – evaluate separately afterwards.
     """
 
@@ -71,6 +73,7 @@ class CFDNTrainer(DetectionTrainer):
         self.cfdn_config = config
         self.hook: Optional[MultiHook] = None
         self.weighter: Optional[AdaptiveLossWeighter] = None
+        self.aux_optimizer: Optional[torch.optim.Optimizer] = None
         self.cont_losses_geo: List[float] = []
         self.cont_losses_sem: List[float] = []
         self.batch_count: int = 0
@@ -118,21 +121,24 @@ class CFDNTrainer(DetectionTrainer):
         print(f"  [CFDN] Auxiliary modules created. Params: {self.hook.get_auxiliary_param_count():,}")
 
     def build_optimizer(self, model, name='auto', lr=0.01, momentum=0.9, decay=0.0, iterations=1e5):
-        """Build optimizer, then add aux parameters if available."""
+        """Build the main optimizer (MuSGD) for YOLO, and a separate AdamW for auxiliary modules."""
         optimizer = super().build_optimizer(model, name, lr, momentum, decay, iterations)
-        if self.hook is None:
-            return optimizer  # aux modules not yet created; will be added later
-        aux_params = list(self.hook.parameters())
-        if self.weighter is not None:
-            aux_params += list(self.weighter.parameters())
-        if aux_params:
-            optimizer.add_param_group({
-                'params': aux_params,
-                'lr': 1e-3,
-                'weight_decay': 0.0,
-                'initial_lr': 1e-3,
-            })
-            print(f"  [CFDN] Aux optimizer group added ({len(aux_params)} tensors).")
+
+        # Create a separate AdamW optimizer for aux modules
+        if self.hook is not None:
+            aux_params = list(self.hook.parameters())
+            if self.weighter is not None:
+                aux_params += list(self.weighter.parameters())
+            if aux_params:
+                self.aux_optimizer = torch.optim.AdamW(
+                    aux_params, lr=1e-3, weight_decay=0.0
+                )
+                print(f"  [CFDN] Separate aux optimizer created with {len(aux_params)} param tensors.")
+            else:
+                self.aux_optimizer = None
+        else:
+            self.aux_optimizer = None
+
         return optimizer
 
     def _patch_forward(self):
@@ -144,7 +150,6 @@ class CFDNTrainer(DetectionTrainer):
         noise_cfg = NoiseConfig(config.noise_types, config.noise_params)
 
         def custom_forward(model_self, batch, *args, **kwargs):
-            # Training batches are dicts containing both 'img' and 'bboxes'
             is_training = (isinstance(batch, dict) and 'img' in batch
                            and model_self.training and 'bboxes' in batch)
 
@@ -209,7 +214,6 @@ class CFDNTrainer(DetectionTrainer):
 
                 return loss, loss_items
             else:
-                # Validation or inference: extract image tensor and ensure fp32
                 if isinstance(batch, dict) and 'img' in batch:
                     batch = batch['img']
                 if isinstance(batch, torch.Tensor) and batch.dtype == torch.float16:
@@ -220,6 +224,35 @@ class CFDNTrainer(DetectionTrainer):
         self._custom_forward = custom_forward
         print("  [CFDN] Forward patching complete.")
 
+    def optimizer_step(self):
+        """Step both the YOLO optimizer and the auxiliary optimizer."""
+        # Unscale gradients for both optimizers
+        if self.scaler:
+            self.scaler.unscale_(self.optimizer)
+            if self.aux_optimizer is not None:
+                self.scaler.unscale_(self.aux_optimizer)
+
+        # Optional gradient clipping
+        clip_val = getattr(self.args, 'clip_grad', 0.0) if hasattr(self.args, 'clip_grad') else 0.0
+        if clip_val > 0:
+            torch.nn.utils.clip_grad_norm_(self.optimizer.param_groups[0]['params'], clip_val)
+            if self.aux_optimizer is not None:
+                torch.nn.utils.clip_grad_norm_(self.aux_optimizer.param_groups[0]['params'], clip_val)
+
+        # Step both optimizers
+        self.optimizer.step()
+        if self.aux_optimizer is not None:
+            self.aux_optimizer.step()
+
+        # Update the scaler once
+        if self.scaler:
+            self.scaler.update()
+
+        # Zero gradients for both
+        self.optimizer.zero_grad()
+        if self.aux_optimizer is not None:
+            self.aux_optimizer.zero_grad()
+
     def on_train_start(self, trainer):
         """Move auxiliary modules to the correct device (GPU) before training."""
         device = torch.device(self.device if self.device else 'cuda:0')
@@ -227,20 +260,6 @@ class CFDNTrainer(DetectionTrainer):
             self.hook = self.hook.to(device)
         if self.weighter is not None:
             self.weighter = self.weighter.to(device)
-
-        # Fallback: ensure aux params are in the optimizer (if build_optimizer ran before setup_model)
-        all_opt_params = {id(p) for g in self.optimizer.param_groups for p in g['params']}
-        aux_params = [p for p in (list(self.hook.parameters()) if self.hook else []) +
-                                 (list(self.weighter.parameters()) if self.weighter else [])
-                      if id(p) not in all_opt_params]
-        if aux_params:
-            self.optimizer.add_param_group({
-                'params': aux_params,
-                'lr': 1e-3,
-                'weight_decay': 0.0,
-                'initial_lr': 1e-3,
-            })
-            print(f"  [CFDN] Aux params added to optimizer in on_train_start ({len(aux_params)} tensors).")
 
     def on_train_batch_end(self, trainer):
         """Log contrastive losses every 100 batches."""
@@ -265,7 +284,7 @@ class CFDNTrainer(DetectionTrainer):
         if had_custom:
             del det_model.__dict__['forward']
 
-        # Clean the EMA model (if it exists)
+        # Clean EMA model (if exists)
         ema_model = None
         had_ema_custom = False
         if hasattr(self, 'ema') and self.ema is not None:
@@ -328,7 +347,6 @@ def train_ablation(config: AblationConfig) -> str:
     with open(str(config_path), 'w') as f:
         json.dump(config.to_dict(), f, indent=2)
 
-    # Build the custom trainer with validation disabled in overrides
     trainer = CFDNTrainer(
         config=config,
         overrides={
@@ -350,7 +368,6 @@ def train_ablation(config: AblationConfig) -> str:
     )
     trainer.train()
 
-    # Save summary
     summary = {
         "run_name": config.run_name,
         "config": config.to_dict(),
