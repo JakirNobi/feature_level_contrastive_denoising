@@ -3,6 +3,7 @@
 CFDN‑YOLO Ablation Study – final custom trainer (validation OFF).
 Auxiliary modules live on the trainer; training path activated only when
 'bboxes' is in the batch. Validation and final_eval are skipped entirely.
+Gradient-conflict diagnostic runs every 50 batches.
 """
 
 import torch
@@ -158,6 +159,33 @@ class CFDNTrainer(DetectionTrainer):
                 loss, loss_items = original_forward(batch, *args, **kwargs)
 
                 geo_loss, sem_loss = self.hook.compute_loss()
+
+                # ---- Gradient-conflict diagnostic (every 50 batches) ----
+                if self.batch_count % 50 == 0 and config.use_geometric and config.use_semantic:
+                    proj_params = list(self.hook.proj_neck.parameters())
+                    geo_grads = torch.autograd.grad(
+                        geo_loss, proj_params, retain_graph=True, allow_unused=True
+                    )
+                    sem_grads = torch.autograd.grad(
+                        sem_loss, proj_params, retain_graph=True, allow_unused=True
+                    )
+                    geo_vec = torch.cat([
+                        g.view(-1) if g is not None else torch.zeros_like(p).view(-1)
+                        for p, g in zip(proj_params, geo_grads)
+                    ])
+                    sem_vec = torch.cat([
+                        g.view(-1) if g is not None else torch.zeros_like(p).view(-1)
+                        for p, g in zip(proj_params, sem_grads)
+                    ])
+                    cos_sim = torch.nn.functional.cosine_similarity(
+                        geo_vec.unsqueeze(0), sem_vec.unsqueeze(0)
+                    ).item()
+                    geo_norm = geo_vec.norm().item()
+                    sem_norm = sem_vec.norm().item()
+                    print(f"[GRAD CONFLICT] batch={self.batch_count} "
+                          f"cosine={cos_sim:.4f} "
+                          f"|geo|={geo_norm:.4f} |sem|={sem_norm:.4f}")
+
                 if config.use_geometric or config.use_semantic:
                     if self.weighter is not None:
                         epoch = self.epoch
@@ -232,15 +260,28 @@ class CFDNTrainer(DetectionTrainer):
         pass
 
     def save_model(self):
-        """Temporarily restore original forward before saving, then re-patch."""
         det_model = self.model.module if hasattr(self.model, 'module') else self.model
-        # Restore original forward
-        det_model.forward = self._original_forward
+        had_custom = 'forward' in det_model.__dict__
+        if had_custom:
+            del det_model.__dict__['forward']
+
+        # Clean the EMA model (if it exists)
+        ema_model = None
+        had_ema_custom = False
+        if hasattr(self, 'ema') and self.ema is not None:
+            ema_model = self.ema.ema
+            if hasattr(ema_model, '__dict__'):
+                had_ema_custom = 'forward' in ema_model.__dict__
+                if had_ema_custom:
+                    del ema_model.__dict__['forward']
+
         try:
             super().save_model()
         finally:
-            # Re‑apply custom forward after saving
-            det_model.forward = types.MethodType(self._custom_forward, det_model)
+            if had_custom:
+                det_model.forward = types.MethodType(self._custom_forward, det_model)
+            if had_ema_custom and ema_model is not None:
+                ema_model.forward = types.MethodType(self._custom_forward, ema_model)
 
     def get_summary(self) -> Dict[str, Any]:
         if not self.cont_losses_geo and not self.cont_losses_sem:
