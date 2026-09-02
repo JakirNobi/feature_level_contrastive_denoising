@@ -1,14 +1,14 @@
 """
 Contrastive Denoising Auxiliary Modules for YOLO26s.
-Training-only components discarded at inference.
+Training-only components — discarded at inference, zero overhead.
 
 Components:
-  GeometricEncoder  - Extracts clean edge features via Sobel filters
-  SemanticEncoder   - Extracts clean high-level facial features
-  FusionModule      - Combines geometric + semantic features (unused in split mode)
-  ProjectionHead    - Maps features to contrastive embedding space
-  MultiHook         - Captures neck outputs and computes split contrastive losses
-  AdaptiveLossWeighter - Learned task weighting with loss normalisation and warm-up
+  GeometricEncoder     - Extracts clean edge features via Sobel filters + learnable convs
+  SemanticEncoder      - Extracts clean high-level facial features via lightweight CNN
+  FusionModule         - Combines geometric + semantic features (kept for compatibility)
+  ProjectionHead       - Maps features to contrastive embedding space (64-dim)
+  MultiHook            - Captures neck outputs at P3/P4/P5, computes split contrastive losses
+  AdaptiveLossWeighter - Canonical Kendall et al. homoscedastic uncertainty weighting
 """
 
 import torch
@@ -17,16 +17,22 @@ import torch.nn.functional as F
 from typing import List, Optional, Tuple, Any, Dict
 
 
+# ===================== ENCODERS =====================
+
 class GeometricEncoder(nn.Module):
-    """Extracts clean geometric features using fixed Sobel filters + learnable convs."""
+    """Extracts clean geometric features using fixed Sobel filters + learnable strided convs."""
 
     def __init__(self, out_channels_list: Optional[List[int]] = None) -> None:
         super().__init__()
         if out_channels_list is None:
             out_channels_list = [128, 256, 512]
 
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
-        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_x = torch.tensor(
+            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
+        sobel_y = torch.tensor(
+            [[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32
+        ).view(1, 1, 3, 3)
         self.register_buffer('sobel_x', sobel_x.repeat(3, 1, 1, 1))
         self.register_buffer('sobel_y', sobel_y.repeat(3, 1, 1, 1))
 
@@ -50,9 +56,8 @@ class GeometricEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        # Cast Sobel buffers to match input dtype (handles fp16 AMP transparently)
-        sobel_x = self.sobel_x.to(x.dtype)
-        sobel_y = self.sobel_y.to(x.dtype)
+        sobel_x: torch.Tensor = self.sobel_x  # type: ignore[assignment]
+        sobel_y: torch.Tensor = self.sobel_y  # type: ignore[assignment]
         gx = F.conv2d(x, sobel_x, padding=1, groups=3)
         gy = F.conv2d(x, sobel_y, padding=1, groups=3)
         edges = torch.cat([gx, gy], dim=1)
@@ -89,15 +94,15 @@ class SemanticEncoder(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        x = self.stem(x)               # (B,128,80,80)
-        p3 = self.p3_branch(x)         # (B,128,80,80)
-        p4 = self.p4_branch(p3)        # (B,256,40,40)
-        p5 = self.p5_branch(p4)        # (B,512,20,20)
+        x = self.stem(x)               # (B, 128, 80, 80)
+        p3 = self.p3_branch(x)         # (B, 128, 80, 80)
+        p4 = self.p4_branch(p3)        # (B, 256, 40, 40)
+        p5 = self.p5_branch(p4)        # (B, 512, 20, 20)
         return [p3, p4, p5]
 
 
 class FusionModule(nn.Module):
-    """Combines geometric and semantic features (unused in split‑loss mode)."""
+    """Combines geometric and semantic features (kept for compatibility, unused in split-loss mode)."""
 
     def __init__(self, channels_list: Optional[List[int]] = None) -> None:
         super().__init__()
@@ -108,17 +113,19 @@ class FusionModule(nn.Module):
         self.fuse5 = nn.Conv2d(channels_list[2] * 2, channels_list[2], 1)
         self._fuse_layers = [self.fuse3, self.fuse4, self.fuse5]
 
-    def forward(self, geo_feats: List[torch.Tensor], sem_feats: List[torch.Tensor]) -> List[torch.Tensor]:
-        fused = []
-        for i, (g, s) in enumerate(zip(geo_feats, sem_feats)):
-            x = torch.cat([g, s], dim=1)
-            x = self._fuse_layers[i](x)
-            fused.append(x)
-        return fused
+    def forward(
+        self, geo_feats: List[torch.Tensor], sem_feats: List[torch.Tensor]
+    ) -> List[torch.Tensor]:
+        return [
+            self._fuse_layers[i](torch.cat([g, s], dim=1))
+            for i, (g, s) in enumerate(zip(geo_feats, sem_feats))
+        ]
 
+
+# ===================== PROJECTION HEAD =====================
 
 class ProjectionHead(nn.Module):
-    """1×1 conv MLP to project features to 64‑dim for contrastive loss."""
+    """1×1 conv MLP projecting features to proj_out-dim embeddings for contrastive loss."""
 
     def __init__(self, in_ch: int, hidden_dim: int = 128, out_dim: int = 64) -> None:
         super().__init__()
@@ -133,13 +140,21 @@ class ProjectionHead(nn.Module):
         return self.net(x)
 
 
+# ===================== CONTRASTIVE LOSS =====================
+
 def sampled_contrastive_loss(
     noisy_feats: List[torch.Tensor],
     clean_feats: List[torch.Tensor],
     num_samples: int = 1024,
-    temperature: float = 0.07
+    temperature: float = 0.07,
 ) -> torch.Tensor:
-    """Memory-efficient spatial InfoNCE loss with random sampling."""
+    """
+    Memory-efficient spatial InfoNCE loss averaged over P3, P4, P5.
+
+    For each scale: samples num_samples spatial positions, builds a
+    (B*N) x (B*N) similarity matrix, and applies cross-entropy with
+    the diagonal as positives (matching position, same image).
+    """
     device = noisy_feats[0].device
     total_loss = torch.tensor(0.0, device=device)
     num_scales = len(noisy_feats)
@@ -148,31 +163,44 @@ def sampled_contrastive_loss(
         B, C, H, W = fn.shape
         N = H * W
 
-        fn = F.normalize(fn.view(B, C, -1), dim=1)
-        fc = F.normalize(fc.view(B, C, -1), dim=1)
+        # L2-normalise along channel dim
+        fn = F.normalize(fn.view(B, C, -1), dim=1)   # (B, C, N)
+        fc = F.normalize(fc.view(B, C, -1), dim=1)   # (B, C, N)
 
+        # Random spatial sampling for memory efficiency
         n_samples = min(num_samples, N)
-        idx = torch.randperm(N, device=fn.device)[:n_samples]
+        idx = torch.randperm(N, device=device)[:n_samples]
 
-        fn_sampled = fn[:, :, idx]
-        fc_sampled = fc[:, :, idx]
+        fn_sampled = fn[:, :, idx]   # (B, C, n_samples)
+        fc_sampled = fc[:, :, idx]   # (B, C, n_samples)
 
-        pos_sim = (fn_sampled * fc_sampled).sum(dim=1) / temperature
-        pos_sim = pos_sim.reshape(-1, 1)
-
+        # Reshape to (B*n_samples, C) for batch similarity matrix
         fn_all = fn_sampled.permute(0, 2, 1).reshape(B * n_samples, C)
         fc_all = fc_sampled.permute(0, 2, 1).reshape(B * n_samples, C)
 
-        logits = torch.matmul(fn_all, fc_all.T) / temperature
-        labels = torch.arange(B * n_samples, device=fn.device)
+        # Full similarity matrix: diagonal = positives
+        logits = torch.matmul(fn_all, fc_all.T) / temperature   # (B*n, B*n)
+        labels = torch.arange(B * n_samples, device=device)
 
         total_loss = total_loss + F.cross_entropy(logits, labels)
 
     return total_loss / num_scales
 
 
+# ===================== MULTI-HOOK =====================
+
 class MultiHook(nn.Module):
-    """Captures neck outputs at layers 16,19,22 and computes split contrastive losses."""
+    """
+    Captures YOLO neck outputs at layers 16 (P3), 19 (P4), 22 (P5) via forward hooks.
+    Computes two independent spatial InfoNCE losses:
+      - L_geo: noisy neck vs clean-geometric encoder
+      - L_sem: noisy neck vs clean-semantic encoder
+
+    Both losses share proj_neck (the noisy-side projection head).
+    Gradient-conflict diagnostics confirmed this sharing is fine:
+    geo and sem gradients on proj_neck are orthogonal (cosine ≈ 0),
+    not opposing — so no architectural split is needed.
+    """
 
     def __init__(
         self,
@@ -180,7 +208,7 @@ class MultiHook(nn.Module):
         proj_hidden: int = 128,
         proj_out: int = 64,
         use_geometric: bool = True,
-        use_semantic: bool = True
+        use_semantic: bool = True,
     ) -> None:
         super().__init__()
         if neck_channels is None:
@@ -192,6 +220,7 @@ class MultiHook(nn.Module):
         self.clean_images: Optional[torch.Tensor] = None
         self.features: Dict[int, torch.Tensor] = {}
 
+        # Shared noisy-side projection head (one per scale)
         self.proj_neck = nn.ModuleList([
             ProjectionHead(ch, proj_hidden, proj_out) for ch in neck_channels
         ])
@@ -212,10 +241,10 @@ class MultiHook(nn.Module):
             self.proj_clean_sem = nn.ModuleList([
                 ProjectionHead(ch, proj_hidden, proj_out) for ch in neck_channels
             ])
-
-        # Fusion kept for compatibility but not used with split losses
         if use_geometric and use_semantic:
             self.fusion = FusionModule(neck_channels)
+
+    # ── Hook registration targets ────────────────────────────────────────────
 
     def set_clean(self, clean_imgs: torch.Tensor) -> None:
         self.clean_images = clean_imgs
@@ -232,8 +261,14 @@ class MultiHook(nn.Module):
     def get_neck_outputs(self) -> List[torch.Tensor]:
         return [self.features[16], self.features[19], self.features[22]]
 
+    # ── Loss computation ─────────────────────────────────────────────────────
+
     def compute_loss(self) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (geo_loss, sem_loss). Each is 0.0 if the encoder is disabled."""
+        """
+        Returns (geo_loss, sem_loss).
+        Each is 0.0 if the corresponding encoder is disabled.
+        Clears the captured feature cache after use.
+        """
         device = self.proj_neck[0].net[0].weight.device
         zero = torch.tensor(0.0, device=device)
 
@@ -244,86 +279,94 @@ class MultiHook(nn.Module):
         geo_loss = zero
         sem_loss = zero
 
-        # --- Geometric branch ---
+        # Geometric branch: noisy neck vs clean-edge encoder
         if self.use_geometric and self.geo_encoder is not None and self.proj_clean_geo is not None:
             geo_feats = self.geo_encoder(self.clean_images)
             noisy_proj = [proj(f) for proj, f in zip(self.proj_neck, neck_outs)]
             clean_proj = [proj(f) for proj, f in zip(self.proj_clean_geo, geo_feats)]
             geo_loss = sampled_contrastive_loss(noisy_proj, clean_proj)
 
-        # --- Semantic branch ---
+        # Semantic branch: noisy neck vs clean-semantic encoder
         if self.use_semantic and self.sem_encoder is not None and self.proj_clean_sem is not None:
             sem_feats = self.sem_encoder(self.clean_images)
             noisy_proj = [proj(f) for proj, f in zip(self.proj_neck, neck_outs)]
             clean_proj = [proj(f) for proj, f in zip(self.proj_clean_sem, sem_feats)]
             sem_loss = sampled_contrastive_loss(noisy_proj, clean_proj)
 
-        self.features = {}
+        self.features = {}   # clear cache
         return geo_loss, sem_loss
 
+    # ── Parameter counting ───────────────────────────────────────────────────
+
     def get_auxiliary_param_count(self) -> int:
-        """Count parameters in auxiliary modules (discarded at inference)."""
+        """
+        Returns total trainable parameter count for all auxiliary modules,
+        including proj_neck (training-only noisy-side projection heads).
+        """
         count = 0
-        for mod in [self.proj_neck, self.geo_encoder, self.sem_encoder,
-                    self.proj_clean_geo, self.proj_clean_sem, self.fusion]:
+        for mod in [
+            self.proj_neck,        # noisy-side projection — training only
+            self.geo_encoder,
+            self.sem_encoder,
+            self.proj_clean_geo,
+            self.proj_clean_sem,
+            self.fusion,
+        ]:
             if mod is not None:
                 count += sum(p.numel() for p in mod.parameters())
         return count
 
 
+# ===================== ADAPTIVE LOSS WEIGHTER =====================
+
 class AdaptiveLossWeighter(nn.Module):
     """
-    Learns per‑task weights using homoscedastic uncertainty (Kendall et al.).
-    Internally normalises loss magnitudes with running statistics so that
-    the learned log‑variances only model relative task difficulty.
-    Supports a linear warm‑up ramp over the first N epochs.
+    Canonical Kendall et al. homoscedastic uncertainty weighting.
+
+    Formula (per task i):
+        L_weighted_i = exp(-log_var_i) * L_i + log_var_i
+
+    where log_var_i = log(sigma_i^2) is a learned parameter.
+
+    The precision term exp(-log_var) up-weights tasks with low uncertainty
+    (small sigma), and the regularisation term log_var prevents sigma from
+    going to infinity (which would trivially minimise the precision term).
+
+    Key design decision: raw losses are passed directly — no pre-normalisation.
+    The scale difference between geo and sem losses IS the signal that log_var
+    needs to adapt to. Pre-normalising would destroy that signal and leave
+    log_var with nothing meaningful to learn.
+
+    A linear warm-up ramp scales the entire auxiliary contribution from 0→1
+    over the first warmup_epochs epochs, allowing the backbone to stabilise
+    on the detection objective before contrastive regularisation kicks in.
     """
 
-    def __init__(self, num_tasks: int = 2, warmup_epochs: int = 10, total_epochs: int = 100,
-                 init_log_var: float = 0.0):
+    def __init__(
+        self,
+        num_tasks: int = 2,
+        warmup_epochs: int = 10,
+        total_epochs: int = 100,
+        init_log_var: float = 0.0,
+    ) -> None:
         super().__init__()
         self.log_var = nn.Parameter(torch.full((num_tasks,), init_log_var))
         self.warmup_epochs = warmup_epochs
         self.total_epochs = total_epochs
-        self.register_buffer('running_mean', torch.zeros(num_tasks))
-        self.register_buffer('running_std', torch.ones(num_tasks))
-        self.register_buffer('n_batches', torch.tensor(0, dtype=torch.long))
-        self.momentum = 0.1
 
     def forward(self, losses: List[torch.Tensor], epoch: int) -> torch.Tensor:
         """
         Args:
-            losses: list of scalar tensors, e.g. [geo_loss, sem_loss]
-            epoch: current epoch (0‑indexed)
+            losses : list of scalar loss tensors, e.g. [geo_loss, sem_loss]
+            epoch  : current epoch (0-indexed)
         Returns:
-            Scalar combined loss.
+            Scalar weighted combination with warm-up ramp applied.
         """
-        device = losses[0].device
-        # Update running stats with detached values
-        with torch.no_grad():
-            vals = torch.stack([l.detach() for l in losses])
-            if self.n_batches == 0:
-                self.running_mean.copy_(vals)
-                self.running_std.copy_(torch.ones_like(vals))
-            else:
-                self.running_mean.mul_(1 - self.momentum).add_(vals, alpha=self.momentum)
-                diff = vals - self.running_mean
-                self.running_std.mul_(1 - self.momentum).add_(diff.abs(), alpha=self.momentum).clamp_(min=1e-6)
-            self.n_batches += 1
-
-        # Normalise each loss to approximately unit scale
-        normalized = [(loss - self.running_mean[i].detach()) / self.running_std[i].detach() + 1.0
-                      for i, loss in enumerate(losses)]
-
-        # Homoscedastic uncertainty weighting
         precision = torch.exp(-self.log_var)
-        weighted = [precision[i] * normalized[i] + self.log_var[i] for i in range(len(losses))]
-        total = sum(weighted)
+        total = sum(
+            precision[i] * losses[i] + self.log_var[i]
+            for i in range(len(losses))
+        )
 
-        # Linear warm‑up ramp from 0 to 1
-        if epoch < self.warmup_epochs:
-            ramp = epoch / max(1, self.warmup_epochs)
-        else:
-            ramp = 1.0
-
+        ramp = epoch / max(1, self.warmup_epochs) if epoch < self.warmup_epochs else 1.0
         return ramp * total
