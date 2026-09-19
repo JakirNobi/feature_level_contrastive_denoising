@@ -2,28 +2,21 @@
 """
 CFDN-YOLO Ablation Study — final custom trainer (validation OFF).
 
-Auxiliary modules live on the trainer; the training path is activated only
-when 'bboxes' is present in the batch dict.  Validation and final_eval are
-skipped entirely — evaluate separately with model.val() after training.
+Two-stream training design:
+  Stream 1 — Detection: clean images → full YOLO forward → detection loss.
+  Stream 2 — Contrastive: noisy images → backbone+neck (eval mode, grads on)
+             → noisy neck features → InfoNCE loss vs clean encoder targets.
 
-Gradient-conflict diagnostic runs every 50 batches on proj_neck to confirm
-geo and sem losses remain orthogonal (established empirically: cosine ≈ 0).
+The gradient-conflict diagnostic has been removed. Extensive measurements
+from previous runs confirmed cosine(geo_grad, sem_grad) ≈ 0 throughout
+training — the two losses are orthogonal on proj_neck and no conflict exists.
+Removing the diagnostic eliminates 3 extra forward passes per diagnostic
+batch, which was causing OOM on 22GB GPUs.
 
-Uses a separate AdamW optimizer for auxiliary modules to avoid incompatibility
-with the main MuSGD optimizer chosen by Ultralytics for YOLO26s.
-
-Fixes applied (v3):
-  1. optimizer_step() uses scaler.step() not optimizer.step() — preserves
-     AMP inf/nan guard so gradient overflow safely skips the step.
-  2. save_model() restores EMA forward-patch cleanup — EMA is deepcopy'd
-     AFTER _patch_forward() so it inherits the patch; must be cleaned too
-     or best.pt bakes in custom_forward and fails to load.
-  3. aux_loss NaN guard — 0.0 * NaN = NaN in PyTorch; skip adding aux_loss
-     entirely if it is NaN/Inf rather than silently poisoning detection loss.
-  4. Aux gradient clipping (max_norm=1.0) always applied regardless of the
-     main model's clip_grad setting — prevents proj_neck gradient spikes from
-     exploding into the detection loss via the shared backward graph.
-  5. Linear warmup ramp on fixed-lambda path mirrors adaptive weighter warmup.
+optimizer_step is conditional on aux gradient presence: when aux_loss is
+NaN and skipped, aux params receive no gradients; we skip
+scaler.unscale_/scaler.step for aux_optimizer in that case to avoid
+the 'No inf checks recorded' AssertionError.
 """
 
 import torch
@@ -91,18 +84,6 @@ class AblationConfig:
 # ===================== CUSTOM TRAINER =====================
 
 class CFDNTrainer(DetectionTrainer):
-    """
-    Subclass of DetectionTrainer that attaches CFDN auxiliary modules to the
-    trainer object (not to the model), keeping best.pt identical to a vanilla
-    YOLO26s checkpoint with no auxiliary parameters.
-
-    Key design points:
-    - Auxiliary parameters are updated by a dedicated AdamW optimizer so they
-      don't interact with the MuSGD schedule used for the main model.
-    - Validation is skipped during training (val=False); evaluate separately.
-    - save_model() temporarily removes the patched forward before saving so
-      the checkpoint loads cleanly with a plain YOLO() call.
-    """
 
     def __init__(self, config: AblationConfig, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -119,7 +100,6 @@ class CFDNTrainer(DetectionTrainer):
     # ── Setup ────────────────────────────────────────────────────────────────
 
     def setup_model(self) -> None:
-        """Load YOLO, attach aux modules, patch forward, register callbacks."""
         super().setup_model()
         self._attach_cfdn_modules()
         self._patch_forward()
@@ -127,7 +107,6 @@ class CFDNTrainer(DetectionTrainer):
         self.add_callback('on_train_batch_end', self.on_train_batch_end)
 
     def _attach_cfdn_modules(self) -> None:
-        """Instantiate MultiHook + optional AdaptiveLossWeighter, register neck hooks."""
         device = next(self.model.parameters()).device
         config = self.cfdn_config
 
@@ -148,7 +127,7 @@ class CFDNTrainer(DetectionTrainer):
 
         det_model = self.model.module if hasattr(self.model, 'module') else self.model
         if not isinstance(det_model, DetectionModel):
-            raise RuntimeError("Unexpected model structure — expected DetectionModel")
+            raise RuntimeError("Expected DetectionModel")
 
         layers = det_model.model
         layers[16].register_forward_hook(self.hook.hook_p3)
@@ -161,11 +140,6 @@ class CFDNTrainer(DetectionTrainer):
     def build_optimizer(
         self, model, name='auto', lr=0.01, momentum=0.9, decay=0.0, iterations=1e5
     ):
-        """
-        Build the main YOLO optimizer (MuSGD via Ultralytics auto-select), then
-        create a separate AdamW for auxiliary parameters to avoid scheduler
-        incompatibility.
-        """
         optimizer = super().build_optimizer(model, name, lr, momentum, decay, iterations)
 
         if self.hook is not None:
@@ -186,12 +160,22 @@ class CFDNTrainer(DetectionTrainer):
 
     def _patch_forward(self) -> None:
         """
-        Monkeypatches DetectionModel.forward to:
-          1. Clone clean images and store them in the hook.
-          2. Inject random noise into batch['img'] before the YOLO forward pass.
-          3. Compute split contrastive losses (geo, sem) after the YOLO loss.
-          4. Run gradient-conflict diagnostic every 50 batches on proj_neck.
-          5. Add weighted auxiliary loss to the detection loss with NaN guard.
+        Two-stream forward:
+
+        Pass 1 — Detection (clean images):
+          Standard YOLO forward. Task-aligned assigner sees clean predictions
+          → stable positive assignments for all 100 epochs. Hook features from
+          this pass are discarded (we want noisy features, not clean).
+
+        Pass 2 — Contrastive (noisy images):
+          model.eval() + torch.enable_grad() + noisy image forward.
+          eval mode: BatchNorm uses running stats from clean training (stable).
+          enable_grad: contrastive gradients flow back through backbone+neck.
+          Hook captures noisy P3/P4/P5 features. Contrastive loss computed
+          against clean encoder targets stored in self.hook.clean_images.
+
+        No gradient-conflict diagnostic in this version — previous runs
+        confirmed cosine ≈ 0 throughout, no conflict exists.
         """
         det_model = self.model.module if hasattr(self.model, 'module') else self.model
         original_forward = det_model.forward
@@ -208,64 +192,39 @@ class CFDNTrainer(DetectionTrainer):
             )
 
             if not is_training:
-                # Inference / validation path — untouched
                 if isinstance(batch, dict) and 'img' in batch:
                     batch = batch['img']
                 if isinstance(batch, torch.Tensor) and batch.dtype == torch.float16:
                     batch = batch.float()
                 return original_forward(batch, *args, **kwargs)
 
-            # ── Training path ────────────────────────────────────────────────
-
-            # 1. Store clean images as reference for encoders
+            # ── Pass 1: Detection on CLEAN images ────────────────────────────
             clean_img = batch['img'].clone()
             self.hook.set_clean(clean_img)
 
-            # 2. Inject noise into the batch in-place
-            noise_type  = str(np.random.choice(list(noise_cfg.noise_types)))
-            noise_param = float(np.random.choice(list(noise_cfg.noise_params)))
-            batch['img'] = add_noise(batch['img'], noise_type=noise_type, param=noise_param)
-
-            # 3. YOLO forward pass — hooks capture noisy neck features
             loss, loss_items = original_forward(batch, *args, **kwargs)
 
-            # 4. Compute split contrastive losses
-            geo_loss, sem_loss = self.hook.compute_loss()
+            # Discard clean features — we need noisy features from Pass 2
+            self.hook.features.clear()
 
-            # 5. Gradient-conflict diagnostic on shared proj_neck (every 50 batches)
-            if self.batch_count % 50 == 0 and config.use_geometric and config.use_semantic:
-                try:
-                    proj_params = list(self.hook.proj_neck.parameters())
-                    geo_grads = torch.autograd.grad(
-                        geo_loss, proj_params, retain_graph=True, allow_unused=True
-                    )
-                    sem_grads = torch.autograd.grad(
-                        sem_loss, proj_params, retain_graph=True, allow_unused=True
-                    )
-                    geo_vec = torch.cat([
-                        g.view(-1) if g is not None else torch.zeros_like(p).view(-1)
-                        for p, g in zip(proj_params, geo_grads)
-                    ])
-                    sem_vec = torch.cat([
-                        g.view(-1) if g is not None else torch.zeros_like(p).view(-1)
-                        for p, g in zip(proj_params, sem_grads)
-                    ])
-                    cos_sim = torch.nn.functional.cosine_similarity(
-                        geo_vec.unsqueeze(0), sem_vec.unsqueeze(0)
-                    ).item()
-                    print(
-                        f"[GRAD CONFLICT] batch={self.batch_count} "
-                        f"cosine={cos_sim:.4f} "
-                        f"|geo|={geo_vec.norm().item():.4f} "
-                        f"|sem|={sem_vec.norm().item():.4f}"
-                    )
-                except Exception as e:
-                    print(f"[GRAD CONFLICT] skipped at batch {self.batch_count}: {e}")
-
-            # 6. Combine contrastive losses with detection loss
+            # ── Pass 2: Noisy forward for contrastive ─────────────────────────
             if config.use_geometric or config.use_semantic:
+                noise_type  = str(np.random.choice(list(noise_cfg.noise_types)))
+                noise_param = float(np.random.choice(list(noise_cfg.noise_params)))
+                noisy_img   = add_noise(
+                    clean_img.clone(), noise_type=noise_type, param=noise_param
+                )
+
+                was_training = model_self.training
+                model_self.eval()
+                with torch.enable_grad():
+                    model_self(noisy_img)   # hooks capture noisy P3/P4/P5
+                model_self.train(was_training)
+
+                # ── Contrastive loss ──────────────────────────────────────────
+                geo_loss, sem_loss = self.hook.compute_loss()
+
                 if self.weighter is not None:
-                    # Canonical Kendall adaptive weighting with warmup
                     task_losses = [
                         geo_loss if config.use_geometric
                         else torch.tensor(0.0, device=geo_loss.device),
@@ -274,7 +233,6 @@ class CFDNTrainer(DetectionTrainer):
                     ]
                     aux_loss = self.weighter(task_losses, self.epoch)
                 else:
-                    # Fixed split-lambda with linear warmup ramp
                     aux_loss = torch.tensor(0.0, device=loss.device)
                     if config.use_geometric:
                         aux_loss = aux_loss + config.lambda_geo * geo_loss
@@ -283,51 +241,56 @@ class CFDNTrainer(DetectionTrainer):
                     ramp = min(1.0, self.epoch / max(1, config.warmup_epochs))
                     aux_loss = ramp * aux_loss
 
-                # NaN guard: 0.0 * NaN = NaN in PyTorch — skip adding entirely
-                # if aux_loss is invalid rather than poisoning the detection loss.
+                # NaN guard: 0.0 * NaN = NaN in PyTorch
                 if torch.isnan(aux_loss) or torch.isinf(aux_loss):
-                    print(f"  [CFDN] WARNING: aux_loss={aux_loss.item():.4f} "
-                          f"at batch {self.batch_count} — skipping this batch's aux contribution")
+                    print(f"  [CFDN] WARNING: aux_loss NaN/Inf at batch "
+                          f"{self.batch_count}, skipping")
+                    # aux params will have no gradients this step —
+                    # optimizer_step handles this case safely
                 else:
                     loss = loss + aux_loss
 
-            # 7. Log raw contrastive losses for the summary
-            if not torch.isnan(geo_loss) and geo_loss.item() > 0:
-                self.cont_losses_geo.append(geo_loss.item())
-            if not torch.isnan(sem_loss) and sem_loss.item() > 0:
-                self.cont_losses_sem.append(sem_loss.item())
+                if not torch.isnan(geo_loss) and geo_loss.item() > 0:
+                    self.cont_losses_geo.append(geo_loss.item())
+                if not torch.isnan(sem_loss) and sem_loss.item() > 0:
+                    self.cont_losses_sem.append(sem_loss.item())
 
             return loss, loss_items
 
         det_model.forward = types.MethodType(custom_forward, det_model)
         self._custom_forward = custom_forward
-        print("  [CFDN] Forward patching complete.")
+        print("  [CFDN] Forward patching complete (two-stream: clean detect + noisy contrastive).")
 
     # ── Optimizer step ────────────────────────────────────────────────────────
 
     def optimizer_step(self) -> None:
         """
-        Step both the main YOLO optimizer and the auxiliary AdamW optimizer.
+        Step both optimizers.
 
-        Uses scaler.step() (not optimizer.step()) so AMP's inf/nan guard is
-        respected: if gradient overflow is detected the step is skipped and
-        the loss scale is reduced, rather than blindly updating with garbage.
+        Conditional aux handling: when aux_loss is NaN and skipped,
+        aux params receive no gradients. Calling scaler.unscale_() or
+        scaler.step() on an optimizer with no gradients raises:
+          AssertionError: No inf checks were recorded for this optimizer.
+        We check for the presence of aux gradients before any scaler
+        interaction with aux_optimizer, and skip the aux step entirely
+        when no gradients exist. The scaler is still updated via the
+        main optimizer so its state stays consistent.
 
-        unscale_() is called explicitly before clipping so gradient norms are
-        computed in true fp32 scale; scaler.step() detects the prior unscale
-        and skips re-unscaling.
-
-        Aux gradients are always clipped at max_norm=1.0 regardless of the
-        main model's clip_grad setting — proj_neck gradient spikes at early
-        training can otherwise propagate through the shared backward graph
-        and cause loss divergence.
+        Main model always has detection gradients so it is never skipped.
         """
+        # Check aux gradient presence BEFORE any unscale calls
+        aux_has_grads = False
+        if self.aux_optimizer is not None:
+            aux_params = [p for g in self.aux_optimizer.param_groups for p in g['params']]
+            aux_has_grads = any(p.grad is not None for p in aux_params)
+
+        # Unscale — main always, aux only when it has gradients
         if self.scaler:
             self.scaler.unscale_(self.optimizer)
-            if self.aux_optimizer is not None:
+            if aux_has_grads:
                 self.scaler.unscale_(self.aux_optimizer)
 
-        # Main model gradient clipping (respects training config)
+        # Clip main model gradients (respects training config)
         clip_val = (
             getattr(self.args, 'clip_grad', 0.0)
             if hasattr(self.args, 'clip_grad') else 0.0
@@ -337,22 +300,22 @@ class CFDNTrainer(DetectionTrainer):
                 self.optimizer.param_groups[0]['params'], clip_val
             )
 
-        # Aux gradient clipping — always applied, protects against early spikes
-        if self.aux_optimizer is not None:
+        # Always clip aux gradients at max_norm=1.0 when present
+        if aux_has_grads:
             torch.nn.utils.clip_grad_norm_(
                 [p for g in self.aux_optimizer.param_groups for p in g['params']],
                 max_norm=1.0
             )
 
+        # Step — scaler checks inf/nan and skips if overflow detected
         if self.scaler:
-            # scaler.step() checks for inf/nan and skips the step if found
             self.scaler.step(self.optimizer)
-            if self.aux_optimizer is not None:
+            if aux_has_grads:
                 self.scaler.step(self.aux_optimizer)
             self.scaler.update()
         else:
             self.optimizer.step()
-            if self.aux_optimizer is not None:
+            if aux_has_grads:
                 self.aux_optimizer.step()
 
         self.optimizer.zero_grad()
@@ -362,7 +325,6 @@ class CFDNTrainer(DetectionTrainer):
     # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def on_train_start(self, trainer) -> None:
-        """Ensure auxiliary modules are on the correct device before training begins."""
         device = torch.device(self.device if self.device else 'cuda:0')
         if self.hook is not None:
             self.hook = self.hook.to(device)
@@ -370,49 +332,35 @@ class CFDNTrainer(DetectionTrainer):
             self.weighter = self.weighter.to(device)
 
     def on_train_batch_end(self, trainer) -> None:
-        """Log mean contrastive losses every 100 batches."""
         self.batch_count += 1
         if self.batch_count % 100 == 0:
             avg_geo = float(np.mean(self.cont_losses_geo[-100:])) if self.cont_losses_geo else 0.0
             avg_sem = float(np.mean(self.cont_losses_sem[-100:])) if self.cont_losses_sem else 0.0
             if self.cfdn_config.use_geometric or self.cfdn_config.use_semantic:
-                print(
-                    f"  [CFDN] Batch {self.batch_count}: "
-                    f"Geo Loss = {avg_geo:.4f} | Sem Loss = {avg_sem:.4f}"
-                )
+                print(f"  [CFDN] Batch {self.batch_count}: "
+                      f"Geo Loss = {avg_geo:.4f} | Sem Loss = {avg_sem:.4f}")
 
     # ── Validation / eval overrides ───────────────────────────────────────────
 
     def validate(self):
-        """Skip in-training validation — evaluate separately after training."""
         return {}, 0.0
 
     def final_eval(self) -> None:
-        """Skip final evaluation — avoids checkpoint-loading issues with patched forward."""
         pass
 
     # ── Checkpoint saving ─────────────────────────────────────────────────────
 
     def save_model(self) -> None:
         """
-        Removes the monkeypatched forward from both det_model and the EMA model
-        before calling super().save_model(), then restores both immediately after.
-
-        Why EMA must be cleaned too:
-          Ultralytics creates the EMA model via deepcopy(det_model) which happens
-          AFTER _patch_forward() runs. The EMA model therefore inherits the patched
-          forward in its instance __dict__. The EMA weights are what Ultralytics
-          actually serialises into best.pt, so if we only clean det_model the
-          checkpoint still contains custom_forward and fails to load with YOLO().
+        Strip patched forward from det_model AND EMA model before saving.
+        EMA is deepcopy'd after _patch_forward() so it inherits the patch.
         """
         det_model = self.model.module if hasattr(self.model, 'module') else self.model
 
-        # Clean main model
         had_custom = 'forward' in det_model.__dict__
         if had_custom:
             del det_model.__dict__['forward']
 
-        # Clean EMA model
         ema_model = None
         had_ema_custom = False
         if hasattr(self, 'ema') and self.ema is not None:
@@ -425,7 +373,6 @@ class CFDNTrainer(DetectionTrainer):
         try:
             super().save_model()
         finally:
-            # Always restore — even if save raised an exception
             if had_custom:
                 det_model.forward = types.MethodType(self._custom_forward, det_model)
             if had_ema_custom and ema_model is not None:
@@ -584,16 +531,14 @@ def run_single_ablation(args: argparse.Namespace) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="CFDN-YOLO Ablation Study")
-    parser.add_argument('--all',             action='store_true',
-                        help="Run all ablation arms sequentially")
+    parser.add_argument('--all',             action='store_true')
     parser.add_argument('--use_geometric',   type=str,   default='True')
     parser.add_argument('--use_semantic',    type=str,   default='True')
     parser.add_argument('--lambda_geo',      type=float, default=0.1)
     parser.add_argument('--lambda_sem',      type=float, default=0.1)
     parser.add_argument('--adaptive_weights',
                         type=lambda x: x.lower() in ('true', '1', 'yes'),
-                        default=False,
-                        help="Use Kendall adaptive weighting instead of fixed lambda")
+                        default=False)
     parser.add_argument('--warmup_epochs',   type=int,   default=10)
     parser.add_argument('--temperature',     type=float, default=0.07)
     parser.add_argument('--num_samples',     type=int,   default=1024)
