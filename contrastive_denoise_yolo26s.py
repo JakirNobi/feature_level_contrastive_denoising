@@ -1,11 +1,19 @@
 """
-Contrastive Denoising Auxiliary Modules for YOLO26s — Barlow Twins variant (v10.1).
+Contrastive Denoising Auxiliary Modules for YOLO26s — Barlow Twins variant (v11.3).
 
-Fixes vs v10:
-  - Removed stop-gradient on the clean side. Barlow Twins is designed to
-    work without it, and it was interfering with the on-diagonal term.
-  - Persisted clean_neck across the forward so the pilot gap check can
-    find it in on_train_batch_end.
+Design:
+  - Barlow Twins loss on 2048-dim projections.
+  - Clean projections are NOT detached: gradient flows to the encoders AND
+    to the shared neck (via noisy_neck → proj_neck → hooks → neck layers).
+  - Feature-space noise added to clean neck features with detached std.
+  - Encoder ch_std and per-scale embedding gap measured externally.
+
+Changes:
+  v11.2: hook_p3/p4/p5 early-return when the attached layer is in eval()
+         mode, so validation does not accumulate features or retain graph.
+  v11.3: added MultiHook.measure_encoder_health() — per-channel std of
+         geometric and semantic encoder outputs at P3/P4/P5. Near-zero
+         channels indicate dead units. Feeds Section V-D of the paper.
 """
 
 import torch
@@ -120,6 +128,7 @@ def barlow_twins_loss(
 ) -> torch.Tensor:
     z_a = z_a.float()
     z_b = z_b.float()
+
     N, D = z_a.shape
 
     z_a = (z_a - z_a.mean(dim=0)) / (z_a.std(dim=0) + eps)
@@ -137,11 +146,13 @@ def barlow_twins_loss(
 
 class MultiHook(nn.Module):
     """
-    v10.1:
-      - Barlow Twins loss, projection heads at 2048 dims by default.
-      - NO stop-gradient on the clean side (Barlow Twins doesn't need it,
-        and it was interfering with the on-diagonal term).
-      - Persists clean_neck so the pilot gap check can use it.
+    Captures neck outputs at layers 16 (P3), 19 (P4), 22 (P5).
+    v11 reconnected design: no detach on clean_neck or clean projections.
+
+    v11.2: hook functions are no-ops when the attached layer is in eval()
+    mode, so validation does not accumulate features or retain the graph.
+    v11.3: measure_encoder_health() reports per-channel std of encoder
+    outputs at P3/P4/P5 (Section V-D of the paper).
     """
 
     def __init__(
@@ -161,7 +172,7 @@ class MultiHook(nn.Module):
         self.use_semantic  = use_semantic
         self.clean_images: Optional[torch.Tensor] = None
         self.features:     Dict[int, torch.Tensor] = {}
-        self.last_clean_neck: Optional[List[torch.Tensor]] = None   # persisted
+        self.last_clean_neck: Optional[List[torch.Tensor]] = None
 
         self.proj_neck = nn.ModuleList([
             BarlowProjectionHead(ch, proj_hidden, proj_out) for ch in neck_channels
@@ -186,13 +197,21 @@ class MultiHook(nn.Module):
     def set_clean(self, clean_imgs: torch.Tensor) -> None:
         self.clean_images = clean_imgs.float()
 
+    # ---- v11.2: early-return during eval so validation doesn't fill features ----
+
     def hook_p3(self, module: nn.Module, args: Tuple[Any, ...], output: torch.Tensor) -> None:
+        if not module.training:
+            return
         self.features[16] = output
 
     def hook_p4(self, module: nn.Module, args: Tuple[Any, ...], output: torch.Tensor) -> None:
+        if not module.training:
+            return
         self.features[19] = output
 
     def hook_p5(self, module: nn.Module, args: Tuple[Any, ...], output: torch.Tensor) -> None:
+        if not module.training:
+            return
         self.features[22] = output
 
     def get_neck_outputs(self) -> List[torch.Tensor]:
@@ -208,24 +227,20 @@ class MultiHook(nn.Module):
         if self.clean_images is None:
             return zero, zero
 
-        # Persist clean_neck for the pilot gap check
-        self.last_clean_neck = noisy_neck  # placeholder; overwritten below
-
         geo_loss = zero
         sem_loss = zero
 
         if self.use_geometric and self.geo_encoder is not None and self.proj_clean_geo is not None:
-            geo_feats = self.geo_encoder(self.clean_images)
+            geo_feats  = self.geo_encoder(self.clean_images)
             noisy_proj = [proj(f) for proj, f in zip(self.proj_neck, noisy_neck)]
-            # NO stop-gradient on the clean side for Barlow Twins
             clean_proj = [proj(f) for proj, f in zip(self.proj_clean_geo, geo_feats)]
-            geo_loss = self._barlow_over_scales(noisy_proj, clean_proj)
+            geo_loss   = self._barlow_over_scales(noisy_proj, clean_proj)
 
         if self.use_semantic and self.sem_encoder is not None and self.proj_clean_sem is not None:
-            sem_feats = self.sem_encoder(self.clean_images)
+            sem_feats  = self.sem_encoder(self.clean_images)
             noisy_proj = [proj(f) for proj, f in zip(self.proj_neck, noisy_neck)]
             clean_proj = [proj(f) for proj, f in zip(self.proj_clean_sem, sem_feats)]
-            sem_loss = self._barlow_over_scales(noisy_proj, clean_proj)
+            sem_loss   = self._barlow_over_scales(noisy_proj, clean_proj)
 
         self.features = {}
         return geo_loss, sem_loss
@@ -254,6 +269,34 @@ class MultiHook(nn.Module):
             if mod is not None:
                 count += sum(p.numel() for p in mod.parameters())
         return count
+
+    # ---- v11.3: encoder health for Section V-D ----
+
+    @torch.no_grad()
+    def measure_encoder_health(self, clean_imgs: torch.Tensor) -> Dict[str, List[float]]:
+        """
+        Per-channel std of each encoder's outputs at P3/P4/P5.
+        Near-zero channels indicate dead units.
+
+        Returns e.g. {'geo': [std_p3, std_p4, std_p5],
+                      'sem': [std_p3, std_p4, std_p5]}
+        Values are means across channels of the per-channel spatial std.
+        """
+        was_training = self.training
+        self.eval()
+        try:
+            imgs = clean_imgs.float()
+            out: Dict[str, List[float]] = {}
+            if self.geo_encoder is not None:
+                feats = self.geo_encoder(imgs)
+                out['geo'] = [float(f.std(dim=(0, 2, 3)).mean().item()) for f in feats]
+            if self.sem_encoder is not None:
+                feats = self.sem_encoder(imgs)
+                out['sem'] = [float(f.std(dim=(0, 2, 3)).mean().item()) for f in feats]
+            return out
+        finally:
+            if was_training:
+                self.train()
 
 
 # ===================== ADAPTIVE LOSS WEIGHTER =====================
